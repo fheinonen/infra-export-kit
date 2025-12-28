@@ -1,0 +1,5 @@
+# Managed tool versions for mise
+[tools]
+python = "3.13"
+uv = "latest"
+terraform = "latest"
