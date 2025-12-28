@@ -29,7 +29,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 
 # Clone and install
 git clone <repo>
-cd azure_tool
+cd infra-export-kit
 uv sync --dev
 ```
 
