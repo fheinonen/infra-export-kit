@@ -107,6 +107,7 @@ such as `network.tf` and `storage.tf`.
 
 - Key Vault secrets are imported as managed resources; their values will be stored in state if included in module inputs.
 - If you want imports without managing secret values, consider adding `lifecycle { ignore_changes = [value] }` or using data sources.
+- For `azurerm_key_vault_secret`, provider schema requires one of `value` or `value_wo`. Generated migrate output uses an import-only placeholder `value` so configs validate without embedding real secret values in code.
 
 ## Development
 
