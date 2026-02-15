@@ -246,6 +246,291 @@ class TestCategoryModuleFeatures:
         storage_ref = container.attributes.get("storage_account_id", "")
         assert 'this["storage1"]' in storage_ref
 
+    def test_arm_id_rewritten_to_resource_reference(self, transformer: TerraformTransformer) -> None:
+        storage_account_id = (
+            "/subscriptions/sub-id/resourceGroups/rg/providers/Microsoft.Storage/"
+            "storageAccounts/stacmeaccount"
+        )
+        state = TerraformState(
+            resources=[
+                TerraformResource(
+                    resource_type="azurerm_storage_account",
+                    name="storage1",
+                    attributes={"name": "stacmeaccount"},
+                    azure_resource_id=storage_account_id,
+                ),
+                TerraformResource(
+                    resource_type="azurerm_storage_container",
+                    name="container1",
+                    attributes={
+                        "name": "acmeaccountfheinonen",
+                        "storage_account_id": storage_account_id,
+                    },
+                ),
+            ]
+        )
+        result = transformer.transform(state)
+
+        storage_module = next(m for m in result.modules if m.name == "storage")
+        container = next(
+            r for r in storage_module.resources if r.resource_type == "azurerm_storage_container"
+        )
+        storage_ref = container.attributes.get("storage_account_id", "")
+        assert storage_ref == 'azurerm_storage_account.this["storage1"].id'
+
+    def test_duplicate_azure_id_does_not_override_original_owner(
+        self, transformer: TerraformTransformer
+    ) -> None:
+        storage_account_id = (
+            "/subscriptions/sub-id/resourceGroups/rg/providers/Microsoft.Storage/"
+            "storageAccounts/stacmeaccount"
+        )
+        state = TerraformState(
+            resources=[
+                TerraformResource(
+                    resource_type="azurerm_storage_account",
+                    name="storage1",
+                    attributes={"name": "stacmeaccount"},
+                    azure_resource_id=storage_account_id,
+                ),
+                TerraformResource(
+                    resource_type="azurerm_storage_container",
+                    name="acmeaccountfheinonen",
+                    attributes={
+                        "name": "acmeaccountfheinonen",
+                        "storage_account_id": storage_account_id,
+                    },
+                    # Simulates parser fallback extracting a parent ID from attributes.
+                    azure_resource_id=storage_account_id,
+                ),
+            ]
+        )
+        result = transformer.transform(state)
+
+        storage_module = next(m for m in result.modules if m.name == "storage")
+        container = next(
+            r
+            for r in storage_module.resources
+            if r.resource_type == "azurerm_storage_container"
+            and r.name == "acmeaccountfheinonen"
+        )
+        storage_ref = container.attributes.get("storage_account_id", "")
+        assert storage_ref == 'azurerm_storage_account.this["storage1"].id'
+
+    def test_duplicate_azure_id_prefers_best_name_match_even_if_ordered_late(
+        self, transformer: TerraformTransformer
+    ) -> None:
+        storage_account_id = (
+            "/subscriptions/sub-id/resourceGroups/rg/providers/Microsoft.Storage/"
+            "storageAccounts/stacmeaccount"
+        )
+        state = TerraformState(
+            resources=[
+                TerraformResource(
+                    resource_type="azurerm_storage_container",
+                    name="acmeaccountfheinonen",
+                    attributes={
+                        "name": "acmeaccountfheinonen",
+                        "storage_account_id": storage_account_id,
+                    },
+                    azure_resource_id=storage_account_id,
+                ),
+                TerraformResource(
+                    resource_type="azurerm_storage_account",
+                    name="storage1",
+                    attributes={"name": "stacmeaccount"},
+                    azure_resource_id=storage_account_id,
+                ),
+            ]
+        )
+        result = transformer.transform(state)
+
+        storage_module = next(m for m in result.modules if m.name == "storage")
+        container = next(
+            r
+            for r in storage_module.resources
+            if r.resource_type == "azurerm_storage_container"
+            and r.name == "acmeaccountfheinonen"
+        )
+        storage_ref = container.attributes.get("storage_account_id", "")
+        assert storage_ref == 'azurerm_storage_account.this["storage1"].id'
+
+    def test_import_blocks_define_azure_id_owner_for_reference_rewrite(
+        self, transformer: TerraformTransformer
+    ) -> None:
+        storage_account_id = (
+            "/subscriptions/sub-id/resourceGroups/rg/providers/Microsoft.Storage/"
+            "storageAccounts/stacmeaccount"
+        )
+        state = TerraformState(
+            resources=[
+                TerraformResource(
+                    resource_type="azurerm_storage_account",
+                    name="res-1",
+                    attributes={"name": "stacmeaccount"},
+                    azure_resource_id=None,
+                ),
+                TerraformResource(
+                    resource_type="azurerm_storage_container",
+                    name="res-2",
+                    attributes={
+                        "name": "acmeaccountfheinonen",
+                        "storage_account_id": storage_account_id,
+                    },
+                    # Simulates parser extracting parent ID from child attributes.
+                    azure_resource_id=storage_account_id,
+                ),
+            ],
+            import_blocks=[
+                ImportBlock(
+                    id=storage_account_id,
+                    to="azurerm_storage_account.res-1",
+                ),
+                ImportBlock(
+                    id=f"{storage_account_id}/blobServices/default/containers/acmeaccountfheinonen",
+                    to="azurerm_storage_container.res-2",
+                ),
+            ],
+        )
+        result = transformer.transform(state)
+
+        storage_module = next(m for m in result.modules if m.name == "storage")
+        container = next(
+            r
+            for r in storage_module.resources
+            if r.resource_type == "azurerm_storage_container"
+            and r.name == "acmeaccountfheinonen"
+        )
+        storage_ref = container.attributes.get("storage_account_id", "")
+        assert storage_ref == 'azurerm_storage_account.this["stacmeaccount"].id'
+
+    def test_id_key_prefers_matching_resource_type_when_id_is_shared(
+        self, transformer: TerraformTransformer
+    ) -> None:
+        storage_account_id = (
+            "/subscriptions/sub-id/resourceGroups/rg/providers/Microsoft.Storage/"
+            "storageAccounts/stacmeaccount"
+        )
+        state = TerraformState(
+            resources=[
+                TerraformResource(
+                    resource_type="azurerm_storage_account",
+                    name="stacmeaccount",
+                    attributes={"name": "stacmeaccount"},
+                    azure_resource_id=None,
+                ),
+                TerraformResource(
+                    resource_type="azurerm_storage_account_queue_properties",
+                    name="res-34",
+                    attributes={
+                        "storage_account_id": storage_account_id,
+                        "hour_metrics": [{"version": "1.0"}],
+                    },
+                    azure_resource_id=storage_account_id,
+                ),
+                TerraformResource(
+                    resource_type="azurerm_storage_container",
+                    name="acmeaccountfheinonen",
+                    attributes={
+                        "name": "acmeaccountfheinonen",
+                        "storage_account_id": storage_account_id,
+                    },
+                ),
+            ],
+            import_blocks=[
+                ImportBlock(
+                    id=storage_account_id,
+                    to="azurerm_storage_account.stacmeaccount",
+                ),
+                ImportBlock(
+                    id=storage_account_id,
+                    to="azurerm_storage_account_queue_properties.res-34",
+                ),
+            ],
+        )
+        result = transformer.transform(state)
+
+        storage_module = next(m for m in result.modules if m.name == "storage")
+        container = next(
+            r
+            for r in storage_module.resources
+            if r.resource_type == "azurerm_storage_container"
+            and r.name == "acmeaccountfheinonen"
+        )
+        storage_ref = container.attributes.get("storage_account_id", "")
+        assert storage_ref == 'azurerm_storage_account.this["stacmeaccount"].id'
+
+    def test_key_vault_secret_keeps_import_only_attributes(
+        self, transformer: TerraformTransformer
+    ) -> None:
+        state = TerraformState(
+            resources=[
+                TerraformResource(
+                    resource_type="azurerm_key_vault",
+                    name="kv1",
+                    attributes={"name": "kv-auto-certs-001", "location": "eastus"},
+                ),
+                TerraformResource(
+                    resource_type="azurerm_key_vault_secret",
+                    name="secret1",
+                    attributes={
+                        "name": "acme-account-key",
+                        "key_vault_id": "azurerm_key_vault.kv1.id",
+                        "value": "super-secret-value",
+                        "content_type": "application/x-pem-file",
+                        "not_before_date": "2026-02-15T00:00:00Z",
+                        "expiration_date": "2027-02-15T00:00:00Z",
+                        "tags": {"file-encoding": "utf-8"},
+                    },
+                ),
+            ]
+        )
+        result = transformer.transform(state)
+
+        security_module = next(m for m in result.modules if m.name == "security")
+        secret = next(
+            r for r in security_module.resources if r.resource_type == "azurerm_key_vault_secret"
+        )
+        assert sorted(secret.attributes.keys()) == [
+            "content_type",
+            "expiration_date",
+            "key_vault_id",
+            "name",
+            "not_before_date",
+            "tags",
+            "value",
+        ]
+        assert secret.attributes["value"] == 'var.key_vault_secrets["secret1"].value'
+        assert secret.attributes["tags"] == {'file-encoding': 'var.key_vault_secrets["secret1"].tags["file-encoding"]'}
+        assert (
+            secret.attributes["content_type"]
+            == 'var.key_vault_secrets["secret1"].content_type'
+        )
+        assert (
+            secret.attributes["not_before_date"]
+            == 'var.key_vault_secrets["secret1"].not_before_date'
+        )
+        assert (
+            secret.attributes["expiration_date"]
+            == 'var.key_vault_secrets["secret1"].expiration_date'
+        )
+
+        secret_map_name = security_module.resource_type_vars["azurerm_key_vault_secret"]
+        secret_params = security_module.call_params[secret_map_name]["secret1"]
+        assert sorted(secret_params.keys()) == [
+            "content_type",
+            "expiration_date",
+            "name",
+            "not_before_date",
+            "tags",
+            "value",
+        ]
+        assert secret_params["value"] == "__import_only__"
+        assert secret_params["tags"] == {"file-encoding": "utf-8"}
+        assert secret_params["content_type"] == "application/x-pem-file"
+        assert secret_params["not_before_date"] == "2026-02-15T00:00:00Z"
+        assert secret_params["expiration_date"] == "2027-02-15T00:00:00Z"
+
 
 class TestImportBlockRewriting:
     @pytest.fixture

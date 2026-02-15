@@ -133,3 +133,40 @@ class TestTerraformWriter:
 
             main_content = (output_dir / "modules" / "storage" / "main.tf").read_text()
             assert "each.value" in main_content
+
+    def test_key_vault_secret_lifecycle_does_not_ignore_tags(
+        self, transformer: TerraformTransformer, writer: TerraformWriter
+    ) -> None:
+        state = TerraformState(
+            resources=[
+                TerraformResource(
+                    resource_type="azurerm_key_vault",
+                    name="kv1",
+                    attributes={
+                        "name": "kv-auto-certs-001",
+                        "location": "eastus",
+                        "resource_group_name": "rg1",
+                    },
+                ),
+                TerraformResource(
+                    resource_type="azurerm_key_vault_secret",
+                    name="secret1",
+                    attributes={
+                        "name": "acme-fheinonen-eu-ca",
+                        "key_vault_id": "azurerm_key_vault.kv1.id",
+                        "value": "placeholder",
+                        "tags": {"file-encoding": "utf-8"},
+                    },
+                ),
+            ]
+        )
+        result = transformer.transform(state)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            writer.write(result, output_dir)
+
+            main_content = (output_dir / "modules" / "security" / "main.tf").read_text()
+            assert "ignore_changes = [value, value_wo, value_wo_version]" in main_content
+            assert "tags = {" in main_content
+            assert 'each.value.tags["file-encoding"]' in main_content

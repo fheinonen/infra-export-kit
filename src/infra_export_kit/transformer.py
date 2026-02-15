@@ -70,6 +70,8 @@ class TerraformTransformer:
         self._variable_counter: dict[str, int] = defaultdict(int)
         self._name_counter: dict[str, int] = {}
         self._name_mapping: dict[str, str] = {}
+        self._azure_id_mapping: dict[str, str] = {}
+        self._azure_id_candidates: dict[str, list[str]] = {}
 
     def transform(self, state: TerraformState) -> TransformResult:
         result = TransformResult(state=TerraformState())
@@ -81,6 +83,7 @@ class TerraformTransformer:
             result.state.variables = result.extracted_variables
 
         self._name_mapping = self._build_name_mapping(state.resources)
+        self._azure_id_mapping = self._build_azure_id_mapping(state.resources, state.import_blocks)
 
         for resource in state.resources:
             transformed = self._transform_resource(resource, result)
@@ -133,6 +136,44 @@ class TerraformTransformer:
 
         return mapping
 
+    def _build_azure_id_mapping(
+        self,
+        resources: list[TerraformResource],
+        import_blocks: list[ImportBlock],
+    ) -> dict[str, str]:
+        mapping: dict[str, str] = {}
+        scores: dict[str, int] = {}
+        candidates: dict[str, list[str]] = defaultdict(list)
+
+        # Import blocks explicitly define ID ownership.
+        for block in import_blocks:
+            original_to = block.to
+            if original_to.startswith("${") and original_to.endswith("}"):
+                original_to = original_to[2:-1]
+            target_address = self._name_mapping.get(original_to, original_to)
+            normalized_id = self._normalize_azure_id(block.id)
+            target_ref = f"{target_address}.id"
+            if target_ref not in candidates[normalized_id]:
+                candidates[normalized_id].append(target_ref)
+            mapping[normalized_id] = target_ref
+            scores[normalized_id] = 100
+
+        for resource in resources:
+            if not resource.azure_resource_id:
+                continue
+            normalized_id = self._normalize_azure_id(resource.azure_resource_id)
+            address = self._name_mapping.get(resource.address, resource.address)
+            candidate_ref = f"{address}.id"
+            if candidate_ref not in candidates[normalized_id]:
+                candidates[normalized_id].append(candidate_ref)
+            score = self._resource_id_match_score(resource, normalized_id)
+            previous = scores.get(normalized_id, -1)
+            if score >= previous:
+                scores[normalized_id] = score
+                mapping[normalized_id] = candidate_ref
+        self._azure_id_candidates = dict(candidates)
+        return mapping
+
     def _compute_new_name(
         self, name: str, resource_type: str, attrs: dict[str, Any], counter: dict[str, int]
     ) -> str:
@@ -158,6 +199,13 @@ class TerraformTransformer:
         new_name = new_address.split(".", 1)[1] if "." in new_address else resource.name
 
         new_attrs = self._transform_attributes(resource.attributes, result)
+        if resource.resource_type == "azurerm_key_vault_secret":
+            original_tags = resource.attributes.get("tags")
+            if isinstance(original_tags, dict):
+                new_attrs["tags"] = original_tags
+            else:
+                new_attrs.pop("tags", None)
+        new_attrs = self._sanitize_resource_attributes(resource.resource_type, new_attrs)
 
         return TerraformResource(
             resource_type=resource.resource_type,
@@ -165,6 +213,26 @@ class TerraformTransformer:
             attributes=new_attrs,
             azure_resource_id=resource.azure_resource_id,
         )
+
+    def _sanitize_resource_attributes(
+        self, resource_type: str, attrs: dict[str, Any]
+    ) -> dict[str, Any]:
+        if resource_type == "azurerm_key_vault_secret":
+            keep = {
+                "name",
+                "key_vault_id",
+                "value",
+                "tags",
+                "content_type",
+                "not_before_date",
+                "expiration_date",
+            }
+            sanitized = {key: value for key, value in attrs.items() if key in keep}
+            # Provider requires one of value/value_wo even for imported secrets.
+            # Keep real secret values out of generated code by forcing a placeholder.
+            sanitized["value"] = "__import_only__"
+            return sanitized
+        return attrs
 
     def _normalize_resource_name(self, name: str, resource_type: str, attrs: dict[str, Any]) -> str:
         if re.match(r"^res-\d+$", name):
@@ -283,6 +351,13 @@ class TerraformTransformer:
             return updated
 
         if self._is_azure_resource_id(value) and key.endswith("_id"):
+            normalized_id = self._normalize_azure_id(value)
+            selected = self._select_id_reference_for_key(normalized_id, key)
+            if selected:
+                return selected
+            mapped_reference = self._azure_id_mapping.get(normalized_id)
+            if mapped_reference:
+                return mapped_reference
             return value
 
         return value
@@ -304,6 +379,46 @@ class TerraformTransformer:
 
     def _is_azure_resource_id(self, value: str) -> bool:
         return value.startswith("/subscriptions/") and "/providers/" in value
+
+    def _normalize_azure_id(self, value: str) -> str:
+        return value.strip().rstrip("/").lower()
+
+    def _resource_id_match_score(self, resource: TerraformResource, normalized_id: str) -> int:
+        score = 0
+        id_name = normalized_id.rsplit("/", 1)[-1]
+        resource_name = resource.attributes.get("name")
+
+        # Strong signal that the ARM ID belongs to this resource.
+        if isinstance(resource_name, str) and resource_name.lower() == id_name:
+            score += 10
+
+        # Weak signal: top-level resources are usually true ARM ID owners.
+        if not any(key.endswith("_id") for key in resource.attributes):
+            score += 1
+
+        return score
+
+    def _select_id_reference_for_key(self, normalized_id: str, key: str) -> str | None:
+        candidates = self._azure_id_candidates.get(normalized_id, [])
+        if not candidates:
+            return None
+
+        expected_resource_type = self._expected_resource_type_from_id_key(key)
+        if expected_resource_type:
+            expected_prefix = f"{expected_resource_type}."
+            for candidate in candidates:
+                if candidate.startswith(expected_prefix):
+                    return candidate
+
+        return None
+
+    def _expected_resource_type_from_id_key(self, key: str) -> str | None:
+        if not key.endswith("_id"):
+            return None
+        base = key[: -len("_id")]
+        if not base:
+            return None
+        return f"azurerm_{base}"
 
     def _is_sensitive_attribute(self, attr_name: str) -> bool:
         attr_lower = attr_name.lower()
@@ -452,6 +567,7 @@ class TerraformTransformer:
                 resource.attributes = self._replace_string_literals_by_type(
                     resource_name=resource.name,
                     value=resource.attributes,
+                    resource_type=resource.resource_type,
                     map_name=map_name,
                     resource_map=resource_entry,
                 )
@@ -486,6 +602,7 @@ class TerraformTransformer:
         self,
         resource_name: str,
         value: Any,
+        resource_type: str,
         map_name: str,
         resource_map: dict[str, Any],
         path: list[str | int] | None = None,
@@ -496,12 +613,16 @@ class TerraformTransformer:
         if isinstance(value, dict):
             updated: dict[str, Any] = {}
             for key, nested in value.items():
-                if key in {"location", "resource_group_name", "tags", "depends_on"}:
+                if key in {"location", "resource_group_name", "depends_on"}:
+                    updated[key] = nested
+                    continue
+                if key == "tags" and resource_type != "azurerm_key_vault_secret":
                     updated[key] = nested
                     continue
                 updated[key] = self._replace_string_literals_by_type(
                     resource_name=resource_name,
                     value=nested,
+                    resource_type=resource_type,
                     map_name=map_name,
                     resource_map=resource_map,
                     path=[*path, str(key)],
@@ -512,6 +633,7 @@ class TerraformTransformer:
                 self._replace_string_literals_by_type(
                     resource_name=resource_name,
                     value=item,
+                    resource_type=resource_type,
                     map_name=map_name,
                     resource_map=resource_map,
                     path=[*path, index],

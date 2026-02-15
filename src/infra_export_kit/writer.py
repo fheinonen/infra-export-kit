@@ -279,6 +279,13 @@ class TerraformWriter:
         return lines
 
     def _get_lifecycle_block(self, resource_type: str) -> list[str] | None:
+        if resource_type == "azurerm_key_vault_secret":
+            return [
+                "  lifecycle {",
+                "    ignore_changes = [value, value_wo, value_wo_version]",
+                "  }",
+            ]
+
         prevent_destroy_types = {
             "azurerm_key_vault",
             "azurerm_storage_account",
@@ -332,6 +339,9 @@ class TerraformWriter:
         if key == "depends_on" and isinstance(value, list):
             refs = [self._format_reference(item) for item in value]
             lines.append(f"{prefix}depends_on = [{', '.join(refs)}]")
+        elif key == "tags" and isinstance(value, dict):
+            formatted = self._format_value(value)
+            lines.append(f"{prefix}{key} = {formatted}")
         elif isinstance(value, dict):
             lines.append(f"{prefix}{key} {{")
             for k, v in value.items():
@@ -434,7 +444,17 @@ class TerraformWriter:
                 elif key == "resource_group_name":
                     lines.append("  resource_group_name = var.resource_group_name")
                 elif key == "tags":
-                    lines.append("  tags = var.tags")
+                    if resource_type == "azurerm_key_vault_secret":
+                        replaced = self._replace_for_each_references(
+                            value,
+                            map_name,
+                            default_var_name=default_var_name,
+                            default_map=default_map,
+                        )
+                        formatted = self._format_attribute(key, replaced, indent=1)
+                        lines.extend(formatted)
+                    else:
+                        lines.append("  tags = var.tags")
                 elif key == "depends_on":
                     continue
                 else:
@@ -446,6 +466,11 @@ class TerraformWriter:
                     )
                     formatted = self._format_attribute(key, replaced, indent=1)
                     lines.extend(formatted)
+
+            lifecycle_block = self._get_lifecycle_block(resource_type)
+            if lifecycle_block:
+                lines.append("")
+                lines.extend(lifecycle_block)
 
             lines.append("}")
             lines.append("")
