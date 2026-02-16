@@ -35,6 +35,11 @@ uv sync --dev
 
 ## Usage
 
+### Current reliability status
+
+At the moment, the `migrate` command is the most reliable workflow.
+For consistent results, run `aztfexport` manually first and then run `migrate` on that output.
+
 ### Export resource groups
 
 ```bash
@@ -68,6 +73,15 @@ Options:
 Use `export` when you want the tool to run `aztfexport` against live resource groups.
 Use `migrate` when you already have flat Terraform and want it reorganized into modules with
 import blocks rewritten to match the new module addresses.
+
+Example manual `aztfexport` command that works well with `migrate`:
+
+```bash
+aztfexport resource-group -o ./terraform/aztfexport-flat -n --plain-ui "example-resource-group"
+uv run infra-export-kit migrate ./terraform/aztfexport-flat --output ./terraform/migrated
+```
+
+Important: `aztfexport` options must come before the resource group name.
 
 ```bash
 uv run infra-export-kit migrate ./path/to/aztfexport --output ./terraform
