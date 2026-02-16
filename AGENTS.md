@@ -173,6 +173,12 @@ def config() -> ExportConfig:
 - `test_<method>_<scenario>` or `test_<behavior>`
 - Be descriptive: `test_warns_on_sensitive_attributes`
 
+### Test Data Policy
+
+- Test fixtures and sample data must always be generic and domain-neutral.
+- Do not use customer/company/product/person-specific names, IDs, emails, URLs, or secrets in tests.
+- Prefer neutral placeholders such as `example-*`, `sample-*`, `test-*`, `resource-a`, and `service-endpoint-url`.
+
 ## Key Patterns
 
 ### CLI with Typer
