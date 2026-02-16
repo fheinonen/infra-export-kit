@@ -16,8 +16,8 @@ resource "azurerm_storage_account" "stacmeaccount" {
   account_replication_type = "LRS"
 }
 
-resource "azurerm_storage_container" "acmeaccountfheinonen" {
-  name               = "acmeaccountfheinonen"
+resource "azurerm_storage_container" "examplecontainer" {
+  name               = "examplecontainer"
   storage_account_id = "/subscriptions/sub-id/resourceGroups/rg-certificate-renewal/providers/Microsoft.Storage/storageAccounts/stacmeaccount"
 }
 
@@ -45,8 +45,8 @@ resource "azurerm_key_vault" "auto_certs_001" {
   sku_name            = "standard"
 }
 
-resource "azurerm_key_vault_secret" "acme_fheinonen_eu_ca" {
-  name            = "acme-fheinonen-eu-ca"
+resource "azurerm_key_vault_secret" "example_secret" {
+  name            = "example-secret"
   key_vault_id    = azurerm_key_vault.auto_certs_001.id
   content_type    = "application/x-pem-file"
   not_before_date = "2026-02-15T00:00:00Z"
@@ -65,8 +65,8 @@ import {
 }
 
 import {
-  id = "/subscriptions/sub-id/resourceGroups/rg-certificate-renewal/providers/Microsoft.Storage/storageAccounts/stacmeaccount/blobServices/default/containers/acmeaccountfheinonen"
-  to = azurerm_storage_container.acmeaccountfheinonen
+  id = "/subscriptions/sub-id/resourceGroups/rg-certificate-renewal/providers/Microsoft.Storage/storageAccounts/stacmeaccount/blobServices/default/containers/examplecontainer"
+  to = azurerm_storage_container.examplecontainer
 }
 
 import {
@@ -75,8 +75,8 @@ import {
 }
 
 import {
-  id = "/subscriptions/sub-id/resourceGroups/rg-certificate-renewal/providers/Microsoft.KeyVault/vaults/kv-auto-certs-001/secrets/acme-fheinonen-eu-ca/00000000000000000000000000000000"
-  to = azurerm_key_vault_secret.acme_fheinonen_eu_ca
+  id = "/subscriptions/sub-id/resourceGroups/rg-certificate-renewal/providers/Microsoft.KeyVault/vaults/kv-auto-certs-001/secrets/example-secret/00000000000000000000000000000000"
+  to = azurerm_key_vault_secret.example_secret
 }
 """
 
@@ -108,8 +108,13 @@ def test_pipeline_rewrites_shared_storage_id_to_storage_account(tmp_path: Path) 
     _run_pipeline(input_dir, output_dir)
 
     storage_main = (output_dir / "modules" / "storage" / "main.tf").read_text()
-    assert 'storage_account_id = azurerm_storage_account.this["stacmeaccount"].id' in storage_main
-    assert 'azurerm_storage_container.this["acmeaccountfheinonen"].id' not in storage_main
+    assert (
+        "storage_account_id = try(each.value.storage_account_id, null) != null ? "
+        "azurerm_storage_account.this[each.value.storage_account_id].id : null"
+    ) in storage_main
+    assert 'azurerm_storage_container.this["examplecontainer"].id' not in storage_main
+    modules_tf = (output_dir / "modules.tf").read_text()
+    assert 'storage_account_id = "stacmeaccount"' in modules_tf
 
 
 def test_pipeline_key_vault_secret_keeps_metadata_and_provider_required_value(

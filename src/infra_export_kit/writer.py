@@ -97,7 +97,7 @@ class TerraformWriter:
                 lines.append(f'  description = "{var.description}"')
             lines.append(f"  type        = {var.var_type}")
             if var.default is not None:
-                default_str = self._format_value(var.default)
+                default_str = self._format_value(var.default, allow_function_calls=False)
                 lines.append(f"  default     = {default_str}")
             if var.sensitive:
                 lines.append("  sensitive   = true")
@@ -140,7 +140,7 @@ class TerraformWriter:
         lines: list[str] = []
         for var in variables:
             if var.default is not None:
-                default_str = self._format_value(var.default)
+                default_str = self._format_value(var.default, allow_function_calls=False)
                 lines.append(f"{var.name} = {default_str}")
             else:
                 lines.append(f"# {var.name} = ")
@@ -343,19 +343,28 @@ class TerraformWriter:
             formatted = self._format_value(value)
             lines.append(f"{prefix}{key} = {formatted}")
         elif isinstance(value, dict):
-            lines.append(f"{prefix}{key} {{")
-            for k, v in value.items():
-                lines.extend(self._format_attribute(k, v, indent + 1))
-            lines.append(f"{prefix}}}")
+            if self._should_render_as_map_attribute(key, value):
+                formatted = self._format_value(value)
+                lines.append(f"{prefix}{key} = {formatted}")
+            else:
+                lines.append(f"{prefix}{key} {{")
+                for k, v in value.items():
+                    lines.extend(self._format_attribute(k, v, indent + 1))
+                lines.append(f"{prefix}}}")
         elif isinstance(value, list):
             if all(isinstance(item, dict) for item in value):
+                dynamic_lines = self._format_dynamic_list_block(key, value, indent)
+                if dynamic_lines:
+                    lines.extend(dynamic_lines)
+                    return lines
                 for item in value:
                     lines.append(f"{prefix}{key} {{")
                     for k, v in item.items():
                         lines.extend(self._format_attribute(k, v, indent + 1))
                     lines.append(f"{prefix}}}")
             else:
-                formatted = self._format_value(value)
+                collapsed = self._collapse_indexed_each_value_list(value)
+                formatted = self._format_value(collapsed if collapsed is not None else value)
                 lines.append(f"{prefix}{key} = {formatted}")
         else:
             formatted = self._format_value(value)
@@ -363,17 +372,80 @@ class TerraformWriter:
 
         return lines
 
+    def _format_dynamic_list_block(
+        self, key: str, value: list[Any], indent: int
+    ) -> list[str] | None:
+        if not value or not all(isinstance(item, dict) for item in value):
+            return None
+
+        merged_template: dict[str, Any] = {}
+        for item in value:
+            merged_template = self._merge_attribute_value(merged_template, item)
+
+        rewritten_template = self._rewrite_dynamic_block_references(merged_template, key)
+        if not self._has_dynamic_key_reference(rewritten_template, key):
+            return None
+        prefix = "  " * indent
+        lines: list[str] = []
+        lines.append(f'{prefix}dynamic "{key}" {{')
+        lines.append(f"{prefix}  for_each = coalesce(try(each.value.{key}, null), [])")
+        lines.append(f"{prefix}  content {{")
+        for nested_key, nested_value in rewritten_template.items():
+            lines.extend(self._format_attribute(nested_key, nested_value, indent + 2))
+        lines.append(f"{prefix}  }}")
+        lines.append(f"{prefix}}}")
+        return lines
+
+    def _rewrite_dynamic_block_references(self, value: Any, key: str) -> Any:
+        if isinstance(value, dict):
+            return {
+                nested_key: self._rewrite_dynamic_block_references(nested_value, key)
+                for nested_key, nested_value in value.items()
+            }
+        if isinstance(value, list):
+            return [self._rewrite_dynamic_block_references(item, key) for item in value]
+        if isinstance(value, str):
+            updated = value
+            direct_pattern = rf"each\.value\.{re.escape(key)}\[\d+\]"
+            updated = re.sub(direct_pattern, f"{key}.value", updated)
+            nested_pattern = (
+                rf"[A-Za-z_][A-Za-z0-9_]*\.value(?:\.[A-Za-z0-9_]+|\[[0-9]+\])*"
+                rf"\.{re.escape(key)}\[\d+\]"
+            )
+            updated = re.sub(nested_pattern, f"{key}.value", updated)
+            return updated
+        return value
+
+    def _has_dynamic_key_reference(self, value: Any, key: str) -> bool:
+        if isinstance(value, dict):
+            return any(self._has_dynamic_key_reference(v, key) for v in value.values())
+        if isinstance(value, list):
+            return any(self._has_dynamic_key_reference(v, key) for v in value)
+        if isinstance(value, str):
+            return f"{key}.value" in value
+        return False
+
     def _format_reference(self, value: str) -> str:
         if self._is_terraform_reference(value):
             return value
         return f'"{value}"'
 
-    def _format_value(self, value: Any) -> str:
+    def _format_value(self, value: Any, allow_function_calls: bool = True) -> str:
         if value is None:
             return "null"
         elif isinstance(value, bool):
             return "true" if value else "false"
         elif isinstance(value, str):
+            if (
+                not allow_function_calls
+                and value.startswith(("jsonencode(", "yamlencode(", "tomap(", "tolist(", "toset("))
+            ):
+                if value.startswith("jsonencode(") and value.endswith(")"):
+                    inner = value[len("jsonencode(") : -1]
+                    escaped_inner = inner.replace("\\", "\\\\").replace('"', '\\"')
+                    return f'"{escaped_inner}"'
+                escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+                return f'"{escaped}"'
             if self._is_terraform_reference(value):
                 return value
             if "\n" in value:
@@ -383,18 +455,57 @@ class TerraformWriter:
         elif isinstance(value, (int, float)):
             return str(value)
         elif isinstance(value, list):
-            items = [self._format_value(item) for item in value]
+            items = [
+                self._format_value(item, allow_function_calls=allow_function_calls) for item in value
+            ]
             return f"[{', '.join(items)}]"
         elif isinstance(value, dict):
-            items = [f"{k} = {self._format_value(v)}" for k, v in value.items()]
+            items = [
+                (
+                    f"{self._format_hcl_key(k)} = "
+                    f"{self._format_value(v, allow_function_calls=allow_function_calls)}"
+                )
+                for k, v in value.items()
+            ]
             return "{\n    " + "\n    ".join(items) + "\n  }"
         else:
             return json.dumps(value)
 
+    def _should_render_as_map_attribute(self, key: str, value: dict[str, Any]) -> bool:
+        if not value:
+            return False
+
+        known_map_attribute_keys = {
+            "app_settings",
+            "parameters",
+            "workflow_parameters",
+            "header",
+            "parameter_values",
+        }
+        if key in known_map_attribute_keys:
+            return True
+        if key.endswith("_settings"):
+            return True
+
+        return any(not self._is_valid_identifier(str(k)) for k in value)
+
+    def _is_valid_identifier(self, value: str) -> bool:
+        return bool(re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", value))
+
+    def _format_hcl_key(self, key: str) -> str:
+        if self._is_valid_identifier(key):
+            return key
+        escaped = key.replace("\\", "\\\\").replace('"', '\\"')
+        return f'"{escaped}"'
+
     def _is_terraform_reference(self, value: str) -> bool:
         if value.startswith(("var.", "local.", "module.", "each.", "try(", "coalesce(")):
             return True
-        tf_resource_pattern = r"^azurerm_[a-z_]+\.[a-z0-9_]+(\[[^\]]+\])?(\.[a-z_]+)*$"
+        if value.startswith(("jsonencode(", "yamlencode(", "tomap(", "tolist(", "toset(")):
+            return True
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\.value(\.[A-Za-z0-9_]+|\[[^\]]+\])*$", value):
+            return True
+        tf_resource_pattern = r"^azurerm_[a-z_]+\.[a-z0-9_-]+(\[[^\]]+\])?(\.[a-z_]+)*$"
         return bool(re.match(tf_resource_pattern, value))
 
     def _write_modules(self, output_dir: Path, modules: list[GeneratedModule]) -> None:
@@ -436,6 +547,11 @@ class TerraformWriter:
             merged_attrs: dict[str, Any] = {}
             for resource in resources:
                 merged_attrs = self._merge_attribute_templates(merged_attrs, resource.attributes)
+            merged_attrs = self._inject_resource_required_fallbacks(
+                resource_type,
+                merged_attrs,
+                default_var_name=default_var_name,
+            )
 
             sorted_attrs = self._sort_attributes(merged_attrs)
             for key, value in sorted_attrs.items():
@@ -475,6 +591,42 @@ class TerraformWriter:
             lines.append("}")
             lines.append("")
 
+    def _inject_resource_required_fallbacks(
+        self,
+        resource_type: str,
+        merged_attrs: dict[str, Any],
+        default_var_name: str | None = None,
+    ) -> dict[str, Any]:
+        patched = dict(merged_attrs)
+        if resource_type == "azurerm_api_management_api":
+            if "display_name" not in patched:
+                patched["display_name"] = (
+                    "try(each.value.source_api_id, null) == null ? "
+                    "coalesce(try(each.value.display_name, null), each.value.name) : "
+                    "try(each.value.display_name, null)"
+                )
+            if "protocols" not in patched:
+                patched["protocols"] = (
+                    "try(each.value.source_api_id, null) == null ? "
+                    "coalesce(try(each.value.protocols, null), [\"https\"]) : "
+                    "try(each.value.protocols, null)"
+                )
+        if resource_type == "azurerm_monitor_smart_detector_alert_rule":
+            default_ids = "[]"
+            if default_var_name:
+                default_ids = f"try(var.{default_var_name}.action_group[0].ids, null)"
+            patched["action_group"] = {
+                "ids": (
+                    "coalesce("
+                    "try(each.value.action_group[0].ids, null), "
+                    f"{default_ids}, "
+                    "[])"
+                )
+            }
+        if resource_type == "azurerm_logic_app_action_custom":
+            patched["body"] = 'coalesce(try(each.value.body, null), jsonencode({}))'
+        return patched
+
     def _write_module_variables(self, module_dir: Path, module: GeneratedModule) -> None:
         lines: list[str] = []
 
@@ -484,7 +636,7 @@ class TerraformWriter:
                 lines.append(f'  description = "{var.description}"')
             lines.append(f"  type        = {var.var_type}")
             if var.default is not None:
-                default_str = self._format_value(var.default)
+                default_str = self._format_value(var.default, allow_function_calls=False)
                 lines.append(f"  default     = {default_str}")
             lines.append("}")
             lines.append("")
@@ -632,15 +784,70 @@ class TerraformWriter:
                 suffix = match.group(1)
                 ref = f"each.value{suffix}"
                 if default_map is None or default_var_name is None:
+                    if self._requires_safe_attribute_access(suffix):
+                        return f"try({ref}, null)"
                     return ref
                 path = self._parse_reference_suffix(suffix)
                 if self._path_has_default(default_map, path):
                     default_ref = f"var.{default_var_name}{suffix}"
                     safe_ref = f"try({ref}, null)"
                     return f"{safe_ref} != null ? {safe_ref} : {default_ref}"
+                if self._requires_safe_attribute_access(suffix):
+                    return f"try({ref}, null)"
                 return ref
-            return value
+            embedded_pattern = rf'var\.{re.escape(map_name)}\["[^"]+"\]((?:\.[A-Za-z_][A-Za-z0-9_]*|\[[^\]]+\])*)'
+            replaced = re.sub(embedded_pattern, lambda m: f"each.value{m.group(1)}", value)
+            return self._wrap_nullable_each_index_reference(replaced)
         return value
+
+    def _wrap_nullable_each_index_reference(self, value: str) -> str:
+        if " ? " in value and " : " in value:
+            return value
+        match = re.match(
+            r"^(azurerm_[a-z_]+\.this\[)(each\.value(?:\.[A-Za-z_][A-Za-z0-9_]*|\[[^\]]+\])+)(\]\..+)$",
+            value,
+        )
+        if not match:
+            return value
+        _, index_ref, _ = match.groups()
+        return f"try({index_ref}, null) != null ? {value} : null"
+
+    def _requires_safe_attribute_access(self, suffix: str) -> bool:
+        path = self._parse_reference_suffix(suffix)
+        if len(path) <= 1:
+            return False
+        return True
+
+    def _collapse_indexed_each_value_list(self, value: list[Any]) -> str | None:
+        if not value or not all(isinstance(item, str) for item in value):
+            return None
+
+        pattern = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\.value(.+)\[(\d+)\]$")
+        heads: list[str] = []
+        bases: list[str] = []
+        indexes: list[int] = []
+        for item in value:
+            match = pattern.match(item)
+            if not match:
+                return None
+            head, base, index = match.groups()
+            heads.append(head)
+            bases.append(base)
+            indexes.append(int(index))
+
+        first_head = heads[0]
+        if any(head != first_head for head in heads):
+            return None
+
+        first_base = bases[0]
+        if any(base != first_base for base in bases):
+            return None
+
+        expected = list(range(len(indexes)))
+        if sorted(indexes) != expected:
+            return None
+
+        return f"{first_head}.value{first_base}"
 
     def _parse_reference_suffix(self, suffix: str) -> list[str | int]:
         if not suffix:
