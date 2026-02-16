@@ -35,6 +35,24 @@ SECRET_VALUE_PATTERNS = [
     r"^[A-Za-z0-9+/]{20,}={0,2}$",
 ]
 
+DESCRIPTIVE_NAME_KEYS = [
+    "name",
+    "operation_id",
+    "display_name",
+    "api_name",
+    "path",
+    "url_template",
+    "title",
+]
+
+NON_DESCRIPTIVE_NAME_KEYS = {
+    "resource_group_name",
+    "location",
+    "api_management_name",
+    "subscription_id",
+    "tenant_id",
+}
+
 EXTRACTABLE_ATTRIBUTES = [
     "location",
     "resource_group_name",
@@ -46,6 +64,12 @@ EXTRACTABLE_ATTRIBUTES = [
 
 DEPRECATED_ATTRIBUTE_RENAMES: dict[str, str] = {
     "enable_rbac_authorization": "rbac_authorization_enabled",
+}
+
+# Resources typically created/owned by Azure services and not safe to manage directly
+# in generated IaC by default.
+AZURE_MANAGED_RESOURCE_TYPES: set[str] = {
+    "azurerm_log_analytics_workspace_table_custom_log",
 }
 
 
@@ -75,24 +99,29 @@ class TerraformTransformer:
 
     def transform(self, state: TerraformState) -> TransformResult:
         result = TransformResult(state=TerraformState())
+        filtered_resources, filtered_imports = self._filter_excluded_resources(
+            state.resources, state.import_blocks
+        )
 
         result.state.providers = state.providers.copy()
 
         if self.config.extract_variables:
-            result.extracted_variables = self._extract_common_variables(state.resources)
+            result.extracted_variables = self._extract_common_variables(filtered_resources)
             result.state.variables = result.extracted_variables
 
-        self._name_mapping = self._build_name_mapping(state.resources)
-        self._azure_id_mapping = self._build_azure_id_mapping(state.resources, state.import_blocks)
+        self._name_mapping = self._build_name_mapping(filtered_resources)
+        self._azure_id_mapping = self._build_azure_id_mapping(filtered_resources, filtered_imports)
 
-        for resource in state.resources:
+        for resource in filtered_resources:
             transformed = self._transform_resource(resource, result)
+            if transformed is None:
+                continue
             result.state.resources.append(transformed)
 
         if self.config.use_modules:
             module_generator = ModuleGenerator()
             result.modules = module_generator.generate_category_modules(result.state.resources)
-            category_call_params = self._build_category_call_params(state.resources)
+            category_call_params = self._build_category_call_params(filtered_resources)
             for module in result.modules:
                 if module.is_category_module:
                     params = category_call_params.get(module.name)
@@ -101,10 +130,10 @@ class TerraformTransformer:
             self._hoist_category_string_values(result.modules)
 
             result.address_mapping = self._build_module_address_mapping(
-                state.resources, result.modules
+                filtered_resources, result.modules
             )
             result.rewritten_imports = self._rewrite_import_blocks(
-                state.import_blocks, result.address_mapping
+                filtered_imports, result.address_mapping
             )
 
             result.remaining_resources = []
@@ -121,6 +150,35 @@ class TerraformTransformer:
         result.state.outputs = result.generated_outputs
 
         return result
+
+    def _filter_excluded_resources(
+        self,
+        resources: list[TerraformResource],
+        import_blocks: list[ImportBlock],
+    ) -> tuple[list[TerraformResource], list[ImportBlock]]:
+        filtered_resources = [
+            resource
+            for resource in resources
+            if resource.resource_type not in AZURE_MANAGED_RESOURCE_TYPES
+        ]
+
+        filtered_imports: list[ImportBlock] = []
+        for block in import_blocks:
+            resource_type = self._resource_type_from_import_to(block.to)
+            if resource_type and resource_type in AZURE_MANAGED_RESOURCE_TYPES:
+                continue
+            filtered_imports.append(block)
+
+        return filtered_resources, filtered_imports
+
+    def _resource_type_from_import_to(self, to_value: str) -> str | None:
+        raw = to_value
+        if raw.startswith("${") and raw.endswith("}"):
+            raw = raw[2:-1]
+        match = re.match(r"^(azurerm_[a-z_]+)\.[A-Za-z0-9_-]+$", raw)
+        if not match:
+            return None
+        return match.group(1)
 
     def _build_name_mapping(self, resources: list[TerraformResource]) -> dict[str, str]:
         mapping: dict[str, str] = {}
@@ -177,23 +235,23 @@ class TerraformTransformer:
     def _compute_new_name(
         self, name: str, resource_type: str, attrs: dict[str, Any], counter: dict[str, int]
     ) -> str:
-        if re.match(r"^res-\d+$", name):
-            azure_name = attrs.get("name")
-            if azure_name and isinstance(azure_name, str):
-                base_name = self._sanitize_name(azure_name)
+        match = re.match(r"^res-(\d+)$", name)
+        if match:
+            base_name = self._descriptive_name_from_attrs(attrs)
+            if base_name:
                 key = f"{resource_type}:{base_name}"
                 counter[key] = counter.get(key, 0) + 1
                 if counter[key] == 1:
                     return base_name
                 return f"{base_name}_{counter[key]}"
-            return name
+            return self._generated_fallback_name(resource_type, match.group(1))
         return self._apply_naming_convention(name)
 
     def _transform_resource(
         self,
         resource: TerraformResource,
         result: TransformResult,
-    ) -> TerraformResource:
+    ) -> TerraformResource | None:
         old_address = resource.address
         new_address = self._name_mapping.get(old_address, old_address)
         new_name = new_address.split(".", 1)[1] if "." in new_address else resource.name
@@ -206,6 +264,8 @@ class TerraformTransformer:
             else:
                 new_attrs.pop("tags", None)
         new_attrs = self._sanitize_resource_attributes(resource.resource_type, new_attrs)
+        if self._should_skip_resource(resource.resource_type, new_attrs):
+            return None
 
         return TerraformResource(
             resource_type=resource.resource_type,
@@ -232,17 +292,89 @@ class TerraformTransformer:
             # Keep real secret values out of generated code by forcing a placeholder.
             sanitized["value"] = "__import_only__"
             return sanitized
+        if resource_type == "azurerm_api_management_backend":
+            sanitized = dict(attrs)
+            tls_value = sanitized.get("tls")
+            if self._is_empty_value(tls_value):
+                sanitized.pop("tls", None)
+            return sanitized
+        if resource_type == "azurerm_api_management_named_value":
+            sanitized = dict(attrs)
+            if "value" not in sanitized and "value_from_key_vault" not in sanitized:
+                # Provider schema requires one of value/value_from_key_vault.
+                sanitized["value"] = "__import_only__"
+            return sanitized
+        if resource_type == "azurerm_api_management_logger":
+            sanitized = dict(attrs)
+            eventhub = sanitized.get("eventhub")
+            if isinstance(eventhub, list):
+                valid_eventhub_blocks: list[dict[str, Any]] = []
+                for block in eventhub:
+                    if not isinstance(block, dict):
+                        continue
+                    has_connection_string = isinstance(block.get("connection_string"), str) and bool(
+                        block.get("connection_string")
+                    )
+                    has_endpoint_uri = isinstance(block.get("endpoint_uri"), str) and bool(
+                        block.get("endpoint_uri")
+                    )
+                    if has_connection_string or has_endpoint_uri:
+                        valid_eventhub_blocks.append(block)
+                if valid_eventhub_blocks:
+                    sanitized["eventhub"] = valid_eventhub_blocks
+                else:
+                    sanitized.pop("eventhub", None)
+            return sanitized
+        if resource_type == "azurerm_log_analytics_workspace_table_custom_log":
+            sanitized = dict(attrs)
+            columns = sanitized.get("column")
+            if self._is_empty_value(columns):
+                # Provider requires at least one column block.
+                sanitized["column"] = [{"name": "RawData", "type": "string"}]
+            return sanitized
+        if resource_type == "azurerm_windows_function_app":
+            sanitized = dict(attrs)
+            site_config = sanitized.get("site_config")
+            if isinstance(site_config, list):
+                cleaned_site_config: list[Any] = []
+                for block in site_config:
+                    if not isinstance(block, dict):
+                        cleaned_site_config.append(block)
+                        continue
+                    updated = dict(block)
+                    for key in (
+                        "ip_restriction_default_action",
+                        "scm_ip_restriction_default_action",
+                    ):
+                        if updated.get(key) == "":
+                            updated.pop(key, None)
+                    cleaned_site_config.append(updated)
+                sanitized["site_config"] = cleaned_site_config
+            return sanitized
         return attrs
 
+    def _should_skip_resource(self, resource_type: str, attrs: dict[str, Any]) -> bool:
+        if resource_type == "azurerm_api_management_logger":
+            has_resource_id = isinstance(attrs.get("resource_id"), str) and bool(attrs.get("resource_id"))
+            eventhub = attrs.get("eventhub")
+            has_eventhub = isinstance(eventhub, list) and len(eventhub) > 0
+            if not has_resource_id and not has_eventhub:
+                return True
+        return False
+
     def _normalize_resource_name(self, name: str, resource_type: str, attrs: dict[str, Any]) -> str:
-        if re.match(r"^res-\d+$", name):
-            azure_name = attrs.get("name")
-            if azure_name and isinstance(azure_name, str):
-                base_name = self._sanitize_name(azure_name)
+        match = re.match(r"^res-(\d+)$", name)
+        if match:
+            base_name = self._descriptive_name_from_attrs(attrs)
+            if base_name:
                 return self._ensure_unique_name(base_name, resource_type)
-            return name
+            return self._generated_fallback_name(resource_type, match.group(1))
 
         return self._apply_naming_convention(name)
+
+    def _generated_fallback_name(self, resource_type: str, index: str) -> str:
+        base_type = resource_type.removeprefix("azurerm_")
+        return self._apply_naming_convention(f"{base_type}_{index}")
 
     def _sanitize_name(self, name: str) -> str:
         if name == "@":
@@ -263,6 +395,33 @@ class TerraformTransformer:
             sanitized = f"n{sanitized}"
 
         return sanitized
+
+    def _descriptive_name_from_attrs(self, attrs: dict[str, Any]) -> str | None:
+        for key in DESCRIPTIVE_NAME_KEYS:
+            value = attrs.get(key)
+            sanitized = self._sanitize_descriptive_string(value)
+            if sanitized:
+                return sanitized
+
+        for key, value in attrs.items():
+            if key in NON_DESCRIPTIVE_NAME_KEYS:
+                continue
+            if key.endswith("_name"):
+                sanitized = self._sanitize_descriptive_string(value)
+                if sanitized:
+                    return sanitized
+        return None
+
+    def _sanitize_descriptive_string(self, value: Any) -> str | None:
+        if not isinstance(value, str):
+            return None
+        if not value.strip():
+            return None
+        if "${" in value and "}" in value:
+            return None
+        if self._is_terraform_reference(value):
+            return None
+        return self._sanitize_name(value)
 
     def _apply_naming_convention(self, name: str) -> str:
         if self.config.naming_convention == "snake_case":
@@ -349,6 +508,17 @@ class TerraformTransformer:
             inner = value[2:-1]
             updated = self._update_reference(inner)
             return updated
+
+        if "${" in value and "}" in value:
+            def _replace_interpolation(match: re.Match[str]) -> str:
+                inner = match.group(1)
+                updated = self._update_reference(inner)
+                return f"${{{updated}}}"
+
+            return re.sub(r"\$\{([^}]+)\}", _replace_interpolation, value)
+
+        if key == "destination_resource_id":
+            return value
 
         if self._is_azure_resource_id(value) and key.endswith("_id"):
             normalized_id = self._normalize_azure_id(value)
@@ -441,43 +611,68 @@ class TerraformTransformer:
         resources: list[TerraformResource],
     ) -> list[TerraformVariable]:
         variables: list[TerraformVariable] = []
-        seen_values: dict[str, str] = {}
-
-        locations: set[str] = set()
-        resource_groups: set[str] = set()
+        has_location = False
+        has_resource_group = False
+        location_values: set[str] = set()
+        resource_group_values: set[str] = set()
+        resource_group_resource_names: set[str] = set()
+        non_literal_location = False
+        non_literal_resource_group = False
         tags: dict[str, str] = {}
 
         for resource in resources:
             if "location" in resource.attributes:
-                locations.add(str(resource.attributes["location"]))
+                has_location = True
+                location = resource.attributes["location"]
+                if isinstance(location, str) and self._is_literal_default_value(location):
+                    location_values.add(location)
+                else:
+                    non_literal_location = True
             if "resource_group_name" in resource.attributes:
-                resource_groups.add(str(resource.attributes["resource_group_name"]))
+                has_resource_group = True
+                resource_group_name = resource.attributes["resource_group_name"]
+                if isinstance(resource_group_name, str) and self._is_literal_default_value(
+                    resource_group_name
+                ):
+                    resource_group_values.add(resource_group_name)
+                else:
+                    non_literal_resource_group = True
+            if resource.resource_type == "azurerm_resource_group":
+                rg_name = resource.attributes.get("name")
+                if isinstance(rg_name, str) and self._is_literal_default_value(rg_name):
+                    resource_group_resource_names.add(rg_name)
             if "tags" in resource.attributes and isinstance(resource.attributes["tags"], dict):
                 tags.update(resource.attributes["tags"])
 
-        if len(locations) == 1:
-            location = locations.pop()
+        if has_location:
+            location_default: str | None = None
+            if not non_literal_location and len(location_values) == 1:
+                location_default = next(iter(location_values))
             variables.append(
                 TerraformVariable(
                     name="location",
                     var_type="string",
-                    default=location,
+                    default=location_default,
                     description="Azure region for resources",
                 )
             )
-            seen_values["location"] = location
 
-        if len(resource_groups) == 1:
-            rg = resource_groups.pop()
+        if has_resource_group:
+            resource_group_default: str | None = None
+            if not non_literal_resource_group and len(resource_group_values) == 1:
+                resource_group_default = next(iter(resource_group_values))
+            elif len(resource_group_resource_names) == 1:
+                # Common in migrated flat exports: resource_group_name is a reference
+                # to a single azurerm_resource_group resource declared in the same root.
+                resource_group_default = next(iter(resource_group_resource_names))
             variables.append(
                 TerraformVariable(
                     name="resource_group_name",
                     var_type="string",
-                    default=rg,
+                    default=resource_group_default,
                     description="Name of the resource group",
                 )
             )
-            seen_values["resource_group_name"] = rg
 
         variables.append(
             TerraformVariable(
@@ -499,10 +694,26 @@ class TerraformTransformer:
 
         return variables
 
+    def _is_literal_default_value(self, value: str) -> bool:
+        if value.startswith("${") and value.endswith("}"):
+            return False
+        if "${" in value and "}" in value:
+            return False
+        if self._is_terraform_reference(value):
+            return False
+        return True
+
     def _build_category_call_params(
         self, resources: list[TerraformResource]
     ) -> dict[str, dict[str, Any]]:
         by_category: dict[ResourceCategory, list[TerraformResource]] = defaultdict(list)
+        resource_group_names = {
+            str(resource.attributes["name"])
+            for resource in resources
+            if resource.resource_type == "azurerm_resource_group"
+            and isinstance(resource.attributes.get("name"), str)
+            and self._is_literal_default_value(str(resource.attributes["name"]))
+        }
         for resource in resources:
             by_category[resource.category].append(resource)
 
@@ -522,12 +733,14 @@ class TerraformTransformer:
             params: dict[str, Any] = {}
             if len(location_values) == 1:
                 value = next(iter(location_values))
-                if value is not None:
+                if isinstance(value, str) and self._is_literal_default_value(value):
                     params["location"] = value
             if len(rg_values) == 1:
                 value = next(iter(rg_values))
-                if value is not None:
+                if isinstance(value, str) and self._is_literal_default_value(value):
                     params["resource_group_name"] = value
+                elif len(resource_group_names) == 1:
+                    params["resource_group_name"] = next(iter(resource_group_names))
 
             if params:
                 params_by_category[category.value] = params
@@ -539,6 +752,10 @@ class TerraformTransformer:
             if not module.is_category_module:
                 continue
 
+            apim_policy_to_operation_name = self._build_apim_policy_to_operation_name(
+                module.resources
+            )
+            module_resource_types = {resource.resource_type for resource in module.resources}
             used_names = {var.name for var in module.variables}
             new_vars: list[TerraformVariable] = []
             call_params = dict(module.call_params)
@@ -570,6 +787,8 @@ class TerraformTransformer:
                     resource_type=resource.resource_type,
                     map_name=map_name,
                     resource_map=resource_entry,
+                    module_resource_types=module_resource_types,
+                    apim_policy_to_operation_name=apim_policy_to_operation_name,
                 )
 
             for resource_type, map_name in type_var_names.items():
@@ -605,6 +824,8 @@ class TerraformTransformer:
         resource_type: str,
         map_name: str,
         resource_map: dict[str, Any],
+        module_resource_types: set[str],
+        apim_policy_to_operation_name: dict[str, str] | None = None,
         path: list[str | int] | None = None,
     ) -> Any:
         if path is None:
@@ -625,6 +846,8 @@ class TerraformTransformer:
                     resource_type=resource_type,
                     map_name=map_name,
                     resource_map=resource_map,
+                    module_resource_types=module_resource_types,
+                    apim_policy_to_operation_name=apim_policy_to_operation_name,
                     path=[*path, str(key)],
                 )
             return updated
@@ -636,13 +859,39 @@ class TerraformTransformer:
                     resource_type=resource_type,
                     map_name=map_name,
                     resource_map=resource_map,
+                    module_resource_types=module_resource_types,
+                    apim_policy_to_operation_name=apim_policy_to_operation_name,
                     path=[*path, index],
                 )
                 for index, item in enumerate(value)
             ]
         if isinstance(value, str):
-            if self._is_terraform_reference(value):
+            if "${" in value and "}" in value:
                 return value
+            if self._is_terraform_reference(value):
+                updated_value = self._update_reference(value)
+                ref = self._parse_resource_reference(updated_value)
+                if (
+                    ref
+                    and resource_type == "azurerm_api_management_api_operation_tag"
+                    and path
+                    and path[-1] == "api_operation_id"
+                    and ref["resource_type"] == "azurerm_api_management_api_operation_policy"
+                ):
+                    # API operation tags bind to operation IDs, not operation policy IDs.
+                    ref["resource_type"] = "azurerm_api_management_api_operation"
+                    if apim_policy_to_operation_name:
+                        mapped_name = apim_policy_to_operation_name.get(ref["name"])
+                        if mapped_name:
+                            ref["name"] = mapped_name
+                if ref and ref["resource_type"] in module_resource_types:
+                    if not path:
+                        path = ["value"]
+                    update = self._build_nested_update(path, ref["name"])
+                    self._merge_structures(resource_map, update)
+                    ref_name = self._build_map_reference(map_name, resource_name, path)
+                    return f'{ref["resource_type"]}.this[{ref_name}]{ref["suffix"]}'
+                return updated_value
             if not path:
                 path = ["value"]
             update = self._build_nested_update(path, value)
@@ -657,6 +906,44 @@ class TerraformTransformer:
             reference = self._build_map_reference(map_name, resource_name, path)
             return reference
         return value
+
+    def _build_apim_policy_to_operation_name(
+        self, resources: list[TerraformResource]
+    ) -> dict[str, str]:
+        operation_name_by_api_and_operation_id: dict[tuple[str, str], str] = {}
+        mapping: dict[str, str] = {}
+
+        for resource in resources:
+            if resource.resource_type != "azurerm_api_management_api_operation":
+                continue
+            api_name = resource.attributes.get("api_name")
+            operation_id = resource.attributes.get("operation_id")
+            if isinstance(api_name, str) and isinstance(operation_id, str):
+                operation_name_by_api_and_operation_id[(api_name, operation_id)] = resource.name
+
+        for resource in resources:
+            if resource.resource_type != "azurerm_api_management_api_operation_policy":
+                continue
+            api_name = resource.attributes.get("api_name")
+            operation_id = resource.attributes.get("operation_id")
+            if not isinstance(api_name, str) or not isinstance(operation_id, str):
+                continue
+            operation_name = operation_name_by_api_and_operation_id.get((api_name, operation_id))
+            if operation_name:
+                mapping[resource.name] = operation_name
+
+        return mapping
+
+    def _parse_resource_reference(self, value: str) -> dict[str, str] | None:
+        match = re.match(r"^(azurerm_[a-z_]+)\.([a-z0-9_-]+)(\..+)$", value)
+        if not match:
+            return None
+        resource_type, name, suffix = match.groups()
+        return {
+            "resource_type": resource_type,
+            "name": name,
+            "suffix": suffix,
+        }
 
     def _ensure_unique_var_name(self, base_name: str, used_names: set[str]) -> str:
         if base_name not in used_names:
@@ -819,6 +1106,8 @@ class TerraformTransformer:
             fields = node.get("fields", {})
             if not fields:
                 return "object({})"
+            if any(not self._is_valid_identifier(key) for key in fields):
+                return "map(any)"
             items = []
             for key in sorted(fields):
                 field_type = self._type_node_to_hcl(fields[key])
@@ -829,7 +1118,7 @@ class TerraformTransformer:
     def _is_terraform_reference(self, value: str) -> bool:
         if value.startswith(("var.", "local.", "module.", "each.", "try(", "coalesce(")):
             return True
-        tf_resource_pattern = r"^azurerm_[a-z_]+\.[a-z0-9_]+(\[[^\]]+\])?(\.[a-z_]+)*$"
+        tf_resource_pattern = r"^azurerm_[a-z_]+\.[a-z0-9_-]+(\[[^\]]+\])?(\.[a-z_]+)*$"
         return bool(re.match(tf_resource_pattern, value))
 
     def _extract_common_map_defaults(self, resource_map: dict[str, Any]) -> dict[str, Any]:
@@ -884,6 +1173,8 @@ class TerraformTransformer:
         if isinstance(value, str):
             if path and isinstance(path[-1], str) and path[-1] == "zone_name":
                 return
+            if path and isinstance(path[-1], str) and path[-1].endswith("_id"):
+                return
             values_by_path[tuple(path)][value] += 1
 
     def _remove_default_path(self, value: Any, path: list[str | int]) -> bool:
@@ -925,6 +1216,7 @@ class TerraformTransformer:
         return False
 
     def _rewrite_category_references(self, module: GeneratedModule) -> None:
+        self._normalize_apim_operation_tag_references(module.resources)
         by_type: dict[str, set[str]] = defaultdict(set)
         for resource in module.resources:
             by_type[resource.resource_type].add(resource.name)
@@ -933,6 +1225,53 @@ class TerraformTransformer:
             resource.attributes = self._replace_reference_strings(resource.attributes, by_type)
         for output in module.outputs:
             output.value = self._replace_reference_strings(output.value, by_type)
+
+    def _normalize_apim_operation_tag_references(
+        self, resources: list[TerraformResource]
+    ) -> None:
+        operation_name_by_api_and_operation_id: dict[tuple[str, str], str] = {}
+        policy_by_name: dict[str, TerraformResource] = {}
+
+        for resource in resources:
+            if resource.resource_type == "azurerm_api_management_api_operation":
+                api_name = resource.attributes.get("api_name")
+                operation_id = resource.attributes.get("operation_id")
+                if isinstance(api_name, str) and isinstance(operation_id, str):
+                    operation_name_by_api_and_operation_id[(api_name, operation_id)] = (
+                        resource.name
+                    )
+            elif resource.resource_type == "azurerm_api_management_api_operation_policy":
+                policy_by_name[resource.name] = resource
+
+        if not operation_name_by_api_and_operation_id or not policy_by_name:
+            return
+
+        for resource in resources:
+            if resource.resource_type != "azurerm_api_management_api_operation_tag":
+                continue
+            api_operation_id = resource.attributes.get("api_operation_id")
+            if not isinstance(api_operation_id, str):
+                continue
+            match = re.match(
+                r"^azurerm_api_management_api_operation_policy\.([a-z0-9_-]+)\.id$",
+                api_operation_id,
+            )
+            if not match:
+                continue
+            policy_name = match.group(1)
+            policy = policy_by_name.get(policy_name)
+            if policy is None:
+                continue
+            api_name = policy.attributes.get("api_name")
+            operation_id = policy.attributes.get("operation_id")
+            if not isinstance(api_name, str) or not isinstance(operation_id, str):
+                continue
+            operation_name = operation_name_by_api_and_operation_id.get((api_name, operation_id))
+            if not operation_name:
+                continue
+            resource.attributes["api_operation_id"] = (
+                f"azurerm_api_management_api_operation.{operation_name}.id"
+            )
 
     def _replace_reference_strings(self, value: Any, by_type: dict[str, set[str]]) -> Any:
         if isinstance(value, dict):
@@ -952,8 +1291,28 @@ class TerraformTransformer:
                 if name in by_type.get(resource_type, set()):
                     trailing = suffix or ""
                     return f'{resource_type}.this["{name}"]{trailing}'
-            return value
+            return self._rewrite_embedded_resource_references(value, by_type)
         return value
+
+    def _rewrite_embedded_resource_references(
+        self, value: str, by_type: dict[str, set[str]]
+    ) -> str:
+        address_map: dict[str, str] = {}
+        for resource_type, names in by_type.items():
+            for name in names:
+                address = f"{resource_type}.{name}"
+                address_map[address] = f'{resource_type}.this["{name}"]'
+
+        if not address_map:
+            return value
+
+        pattern = re.compile(r"azurerm_[a-z_]+\.[a-z0-9_]+")
+
+        def _replace(match: re.Match[str]) -> str:
+            address = match.group(0)
+            return address_map.get(address, address)
+
+        return pattern.sub(_replace, value)
 
     def _generate_outputs(
         self,
@@ -1039,8 +1398,6 @@ class TerraformTransformer:
                 mapping[old_address] = module_address
             elif res_module:
                 mapping[old_address] = f"module.{res_module.name}.{new_address}"
-            else:
-                mapping[old_address] = new_address
 
         return mapping
 
@@ -1055,6 +1412,10 @@ class TerraformTransformer:
             original_to = block.to
             if original_to.startswith("${") and original_to.endswith("}"):
                 original_to = original_to[2:-1]
-            new_to = address_mapping.get(original_to, original_to)
+            direct = address_mapping.get(original_to)
+            renamed = address_mapping.get(self._name_mapping.get(original_to, ""))
+            new_to = direct or renamed
+            if not new_to:
+                continue
             rewritten.append(ImportBlock(id=block.id, to=new_to))
         return rewritten
